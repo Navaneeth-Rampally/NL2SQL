@@ -1,7 +1,8 @@
 import os
 import re
-import inspect # <--- Added for async checking
+import inspect
 import asyncio
+import sqlite3
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,29 +12,14 @@ from vanna_setup import vanna_agent
 from vanna.core.user import User, RequestContext
 from vanna.integrations.sqlite import SqliteRunner 
 
-# --- Step 7: SQL Validation Logic ---
+# --- Step 1: SQL Validation Logic ---
 def is_sql_safe(sql: str) -> bool:
     if not sql: return False
     forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE", "EXEC", "GRANT", "REVOKE"]
     sql_upper = sql.upper().strip()
     return sql_upper.startswith("SELECT") and not any(w in sql_upper for w in forbidden)
 
-# --- SECURITY INTERCEPTOR (Fixed for Async Compatibility) ---
-original_run_sql = SqliteRunner.run_sql
-
-async def safe_run_sql(self, sql: str, **kwargs):
-    if not is_sql_safe(sql):
-        raise Exception(f"Security Violation: Rejected unsafe SQL -> {sql}")
-    
-    # Safely await the original function if Vanna expects it to be async
-    if inspect.iscoroutinefunction(original_run_sql):
-        return await original_run_sql(self, sql, **kwargs)
-    return original_run_sql(self, sql, **kwargs)
-
-SqliteRunner.run_sql = safe_run_sql
-
-# --- LIFESPAN AUTO-SEEDING ---
-# --- LIFESPAN AUTO-SEEDING ---
+# --- Step 2: Lifespan for Auto-Seeding ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Server starting: Auto-seeding AI memory...")
@@ -51,7 +37,8 @@ async def lifespan(app: FastAPI):
         await vanna_agent.agent_memory.save_tool_usage(
             question=q, tool_name="run_sql", args={"sql": sql}, context=context, success=True
         )
-        await asyncio.sleep(3) # <--- ADD THIS LINE: This pauses for 3 seconds so Google doesn't block you!
+        # Small delay to keep the local CPU from spiking too hard during boot
+        await asyncio.sleep(1) 
         
     print("✅ Memory seeded. Ready for chats!")
     yield
@@ -71,42 +58,49 @@ async def chat_endpoint(request: ChatRequest):
     
     generated_sql = None
     results_df = None
-    chart_json = None
     summary_text = ""
     
+    print(f"\n--- ASKING OLLAMA: {request.question} ---")
+
+    # Prompt forcing strict SQL output
+    prompt = f"""You are a SQLite database expert. Write a valid SQL query to answer this question.
+    You MUST wrap your SQL query inside a markdown block like this: ```sql\nSELECT ...\n```
+    Question: {request.question}"""
+
     try:
-        # THE FIX: Send the raw question! No confusing markdown instructions. 
-        # Llama 3.3 will naturally pick up the tool and use it correctly.
-        async for component in vanna_agent.send_message(request_context=context, message=request.question):
+        async for component in vanna_agent.send_message(request_context=context, message=prompt):
             comp_type = type(component).__name__
             
-            if comp_type == 'StatusCardComponent' and getattr(component, 'status', '') == 'error':
-                 return {"error": "Vanna Engine Error", "details": getattr(component, 'description', 'Check terminal.')}
-            
-            if hasattr(component, 'sql') and component.sql: generated_sql = component.sql
-            elif hasattr(component, 'query') and component.query: generated_sql = component.query
-            if hasattr(component, 'df') and component.df is not None: results_df = component.df
-            if hasattr(component, 'plotly_json') and component.plotly_json: chart_json = component.plotly_json
-                
+            # Extract text from the stream
+            raw_data = getattr(component, 'text', getattr(component, 'content', str(component)))
             if comp_type not in ['StatusBarUpdateComponent', 'TaskTrackerUpdateComponent', 'ChatInputUpdateComponent']:
-                if hasattr(component, 'text') and component.text: summary_text += component.text + " "
-                elif hasattr(component, 'content') and component.content: summary_text += component.content + " "
+                if raw_data: summary_text += raw_data + " "
 
-        # The fallback stays quietly in the background just in case it forgets to use the tool
-        if not generated_sql and summary_text:
+        # --- THE SANITIZED FALLBACK ---
+        if summary_text:
+            # 1. Try to find the SQL block
             sql_match = re.search(r"```sql\s+(.*?)\s+```", summary_text, re.IGNORECASE | re.DOTALL)
-            if not sql_match: sql_match = re.search(r"(SELECT\s+.*?(?:;|$))", summary_text, re.IGNORECASE | re.DOTALL)
+            if not sql_match:
+                sql_match = re.search(r"(SELECT\s+.*?(?:;|$))", summary_text, re.IGNORECASE | re.DOTALL)
 
             if sql_match:
                 potential_sql = sql_match.group(1).strip()
+                
+                # THE CLEANER: Removes backticks (`) and stray markdown that crash SQLite
+                potential_sql = potential_sql.replace("```sql", "").replace("```", "").replace("`", "").strip()
+                
                 if is_sql_safe(potential_sql):
                     generated_sql = potential_sql
-                    sql_tool = await vanna_agent.tool_registry.get_tool("run_sql")
-                    if sql_tool:
-                        runner_attr = 'sql_runner' if hasattr(sql_tool, 'sql_runner') else 'runner'
-                        runner_instance = getattr(sql_tool, runner_attr)
-                        results_df = await runner_instance.run_sql(sql=generated_sql)
-                        summary_text = "I generated and executed this SQL query for you."
+                    
+                    # Native execution using sqlite3
+                    db_path = os.getenv("DATABASE_PATH")
+                    conn = sqlite3.connect(db_path)
+                    
+                    # Run the query and store in DataFrame
+                    results_df = pd.read_sql_query(generated_sql, conn)
+                    conn.close()
+                    
+                    summary_text = "Query executed successfully."
 
         if not generated_sql:
              return {"error": "The AI did not generate a SQL query.", "details": f"AI's raw output: {summary_text}"}
@@ -117,11 +111,12 @@ async def chat_endpoint(request: ChatRequest):
             "columns": list(results_df.columns) if results_df is not None else [],
             "rows": results_df.values.tolist() if results_df is not None else [],
             "row_count": len(results_df) if results_df is not None else 0,
-            "chart": chart_json,
-            "chart_type": "plotly" if chart_json else None
+            "chart": None,
+            "chart_type": None
         }
         
     except Exception as e:
+        print(f"ERROR: {str(e)}")
         return {"error": "FastAPI Crash.", "details": str(e)}
 
 if __name__ == "__main__":
