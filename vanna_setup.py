@@ -5,38 +5,31 @@ from dotenv import load_dotenv
 from vanna import Agent, AgentConfig
 from vanna.core.registry import ToolRegistry
 from vanna.core.user import UserResolver, User, RequestContext
-
-# Tools and Memory
-from vanna.tools import RunSqlTool
 from vanna.integrations.local.agent_memory import DemoAgentMemory
+from vanna.tools import RunSqlTool
 
-# Integrations
-from vanna.integrations.openai import OpenAILlmService  
+# The Official Ollama Integration
+from vanna.integrations.ollama import OllamaLlmService
 from vanna.integrations.sqlite import SqliteRunner
 
 load_dotenv()
 
 def setup_vanna_agent():
-    # TRICK: Route to Groq's free servers
-    os.environ["OPENAI_BASE_URL"] = "https://api.groq.com/openai/v1"
-    
-    # 1. Initialize the Service using Llama 3.3
-    llm_service = OpenAILlmService(
-        api_key=os.getenv("GROQ_API_KEY"), 
-        model="llama-3.3-70b-versatile"  
+    # 1. Initialize Ollama Service (Running locally on your machine!)
+    llm_service = OllamaLlmService(
+        model="llama3.2", 
     )
 
     # 2. Setup SQLite Runner
     sql_runner = SqliteRunner(database_path=os.getenv("DATABASE_PATH"))
 
-    # 3. Setup Agent Memory (Kept here so main.py lifespan doesn't crash)
+    # 3. Setup Agent Memory 
     agent_memory = DemoAgentMemory(max_items=1000)
 
     # 4. Create Tool Registry
     tools = ToolRegistry()
     
-    # 5. THE FIX: ONLY REGISTER THE SQL TOOL. 
-    # We are hiding VisualizeDataTool and MemoryTools from the AI so it doesn't crash Groq!
+    # 5. Register ONLY the SQL tool for maximum stability
     tools.register_local_tool(
         RunSqlTool(sql_runner=sql_runner), 
         access_groups=['admin', 'user']
@@ -56,5 +49,4 @@ def setup_vanna_agent():
         agent_memory=agent_memory
     )
 
-# This instance is what other files will import
 vanna_agent = setup_vanna_agent()
